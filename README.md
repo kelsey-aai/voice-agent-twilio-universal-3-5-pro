@@ -37,7 +37,7 @@ AssemblyAI Universal-3 Pro    ElevenLabs TTS
 ## Quick start
 
 ```bash
-git clone https://github.com/AssemblyAI/voice-agent-twilio-universal-3-pro
+git clone https://github.com/kelseyefoster/voice-agent-twilio-universal-3-pro
 cd voice-agent-twilio-universal-3-pro
 
 python -m venv .venv && source .venv/bin/activate
