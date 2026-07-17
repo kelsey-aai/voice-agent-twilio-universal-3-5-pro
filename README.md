@@ -1,8 +1,8 @@
-# Twilio phone agent with AssemblyAI Universal-3 Pro Streaming
+# Twilio phone agent with AssemblyAI Universal-3.5 Pro Realtime
 
-Build an AI phone agent that handles real calls using **Twilio Voice + Media Streams** and the **AssemblyAI Universal-3 Pro Streaming model** for real-time speech-to-text.
+Build an AI phone agent that handles real calls using **Twilio Voice + Media Streams** and the **AssemblyAI Universal-3.5 Pro Realtime model** for real-time speech-to-text.
 
-The key detail here: Twilio streams 8kHz μ-law (mulaw) audio. AssemblyAI Universal-3 Pro accepts `pcm_mulaw` at `sample_rate=8000` natively — no resampling, no format conversion.
+The key detail here: Twilio streams 8kHz μ-law (mulaw) audio. AssemblyAI Universal-3.5 Pro Realtime accepts `pcm_mulaw` at `sample_rate=8000` natively — no resampling, no format conversion.
 
 ## Architecture
 
@@ -16,7 +16,8 @@ Your server (/media-stream WebSocket)
      │                        │
      │ mulaw 8kHz audio       │ synthesized mulaw audio
      ▼                        ▲
-AssemblyAI Universal-3 Pro    ElevenLabs TTS
+AssemblyAI Universal-3.5      ElevenLabs TTS
+Pro Realtime
 (wss://streaming.assemblyai.com/v3/ws)
      │ transcript + turn signal
      ▼
@@ -37,8 +38,8 @@ AssemblyAI Universal-3 Pro    ElevenLabs TTS
 ## Quick start
 
 ```bash
-git clone https://github.com/kelseyefoster/voice-agent-twilio-universal-3-pro
-cd voice-agent-twilio-universal-3-pro
+git clone https://github.com/kelsey-aai/voice-agent-twilio-universal-3-5-pro
+cd voice-agent-twilio-universal-3-5-pro
 
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
@@ -65,15 +66,15 @@ ngrok http 8000
 ```python
 ASSEMBLYAI_WS_URL = (
     "wss://streaming.assemblyai.com/v3/ws"
-    "?speech_model=u3-rt-pro"
+    "?speech_model=universal-3-5-pro"
     "&encoding=pcm_mulaw"      # must match Twilio's audio format
     "&sample_rate=8000"        # must match Twilio's 8kHz stream
-    "&end_of_turn_confidence_threshold=0.5"
-    "&min_turn_silence=400"    # slightly more patient on phone calls
+    "&min_turn_silence=400"    # phone audio: wait a beat longer before ending the turn
+    "&max_turn_silence=2000"   # hard ceiling so deliberate callers aren't cut off
 )
 ```
 
-Phone calls have more background noise than browser audio — the slightly higher confidence threshold and longer `min_turn_silence` reduce false triggers on hold music and ambient sound.
+Phone calls have more background noise than browser audio, so a slightly longer `min_turn_silence` reduces premature turn endings, while a `max_turn_silence` ceiling keeps deliberate callers from being cut off. Universal-3.5 Pro Realtime uses **punctuation-based** end-of-turn detection — `end_of_turn_confidence_threshold` does not apply to it (that parameter belongs to the older `universal-streaming` models).
 
 ## Extending the agent
 
@@ -126,7 +127,7 @@ Update your Twilio webhook to the production URL after deploying.
 <div class="blog-cta_component">
   <div class="blog-cta_title">Build your Twilio phone agent today</div>
   <div class="blog-cta_rt w-richtext">
-    <p>Sign up for a free AssemblyAI account and start transcribing Twilio calls with Universal-3 Pro Streaming in under 30 minutes.</p>
+    <p>Sign up for a free AssemblyAI account and start transcribing Twilio calls with Universal-3.5 Pro Realtime in under 30 minutes.</p>
   </div>
   <a href="https://www.assemblyai.com/dashboard/signup" class="button w-button">Start building</a>
 </div>

@@ -53,12 +53,11 @@ Speak naturally — no markdown, no lists. You are on a phone call.
 # Twilio streams audio as 8kHz mulaw — AssemblyAI U3 Pro accepts this natively.
 ASSEMBLYAI_WS_URL = (
     "wss://streaming.assemblyai.com/v3/ws"
-    "?speech_model=u3-rt-pro"
+    "?speech_model=universal-3-5-pro"
     "&encoding=pcm_mulaw"
     "&sample_rate=8000"
-    "&end_of_turn_confidence_threshold=0.5"
     "&min_turn_silence=400"
-    "&max_turn_silence=1200"
+    "&max_turn_silence=2000"
     f"&token={os.environ['ASSEMBLYAI_API_KEY']}"
 )
 
