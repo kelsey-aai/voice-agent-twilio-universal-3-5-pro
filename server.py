@@ -1,10 +1,10 @@
 """
-Twilio phone call voice agent with AssemblyAI Universal-3 Pro Streaming.
+Twilio phone call voice agent with AssemblyAI Universal-3.6 Pro Realtime.
 
 Architecture:
   Caller ──► Twilio ──► (Media Streams WebSocket) ──► This server
                                                            │
-                                          AssemblyAI U3 Pro STT (mulaw 8kHz)
+                                          AssemblyAI Universal-3.6 Pro Realtime (mulaw 8kHz)
                                                            │ transcript
                                                       OpenAI GPT-4o
                                                            │ text
@@ -37,7 +37,7 @@ from openai import AsyncOpenAI
 
 load_dotenv()
 
-app = FastAPI(title="Twilio + AssemblyAI U3 Pro Voice Agent")
+app = FastAPI(title="Twilio + AssemblyAI Universal-3.6 Pro Realtime Voice Agent")
 
 # ── Clients ──────────────────────────────────────────────────────────────────
 aai.settings.api_key = os.environ["ASSEMBLYAI_API_KEY"]
@@ -50,15 +50,18 @@ You are a helpful phone voice assistant. Keep every response under 2 sentences.
 Speak naturally — no markdown, no lists. You are on a phone call.
 """.strip()
 
-# Twilio streams audio as 8kHz mulaw — AssemblyAI U3 Pro accepts this natively.
+GREETING = "Hello! How can I help you today?"
+
+# Twilio streams audio as 8kHz mulaw — Universal-3.6 Pro Realtime accepts this
+# natively. The API key goes in the Authorization header (see media_stream);
+# the `token` query param is only for temporary streaming tokens.
 ASSEMBLYAI_WS_URL = (
     "wss://streaming.assemblyai.com/v3/ws"
-    "?speech_model=universal-3-5-pro"
-    "&encoding=pcm_mulaw"
-    "&sample_rate=8000"
-    "&min_turn_silence=400"
-    "&max_turn_silence=2000"
-    f"&token={os.environ['ASSEMBLYAI_API_KEY']}"
+    "?speech_model=universal-3-6-pro"
+    "&encoding=pcm_mulaw"      # must match Twilio's audio format
+    "&sample_rate=8000"        # must match Twilio's 8kHz stream
+    "&min_turn_silence=400"    # phone audio: wait a beat longer before ending the turn
+    "&max_turn_silence=2000"   # hard ceiling so deliberate callers aren't cut off
 )
 
 
@@ -70,7 +73,7 @@ async def incoming_call(request: Request):
     host = request.headers.get("host", "your-ngrok-url.ngrok.io")
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Polly.Joanna">Hello! How can I help you today?</Say>
+  <Say voice="Polly.Joanna">{GREETING}</Say>
   <Connect>
     <Stream url="wss://{host}/media-stream" />
   </Connect>
@@ -82,7 +85,7 @@ async def incoming_call(request: Request):
 
 @app.websocket("/media-stream")
 async def media_stream(ws: WebSocket):
-    """Bridge: Twilio audio ──► AssemblyAI U3 Pro ──► GPT-4o ──► ElevenLabs ──► Twilio."""
+    """Bridge: Twilio audio ──► AssemblyAI Universal-3.6 Pro Realtime ──► GPT-4o ──► ElevenLabs ──► Twilio."""
     await ws.accept()
 
     stream_sid: Optional[str] = None
@@ -91,7 +94,10 @@ async def media_stream(ws: WebSocket):
     # ── Open AssemblyAI WebSocket ─────────────────────────────────────────
     import websockets
 
-    async with websockets.connect(ASSEMBLYAI_WS_URL) as aai_ws:
+    async with websockets.connect(
+        ASSEMBLYAI_WS_URL,
+        additional_headers={"Authorization": os.environ["ASSEMBLYAI_API_KEY"]},
+    ) as aai_ws:
 
         async def forward_audio_to_assemblyai():
             """Read audio from Twilio, forward raw mulaw bytes to AssemblyAI."""
@@ -127,6 +133,8 @@ async def media_stream(ws: WebSocket):
 
                     if msg_type == "Begin":
                         print(f"AssemblyAI session: {msg.get('id')}")
+                        # Prime the model with the greeting the caller just heard
+                        await send_agent_context(aai_ws, GREETING)
 
                     elif msg_type == "Turn":
                         # Only act on final (end-of-turn) transcripts
@@ -140,6 +148,10 @@ async def media_stream(ws: WebSocket):
                             conversation.append({"role": "assistant", "content": reply})
                             print(f"🤖 Agent: {reply}")
 
+                            # Tell AssemblyAI what the agent just said so the
+                            # caller's next turn is transcribed in context
+                            await send_agent_context(aai_ws, reply)
+
                             # Synthesise and inject audio back into the call
                             if stream_sid:
                                 await speak_on_call(ws, stream_sid, reply)
@@ -152,6 +164,15 @@ async def media_stream(ws: WebSocket):
             forward_audio_to_assemblyai(),
             receive_transcripts_and_respond(),
         )
+
+
+async def send_agent_context(aai_ws, text: str):
+    """Push the agent's last reply mid-stream so the next caller turn is
+    transcribed in context (e.g. primed for an account number)."""
+    await aai_ws.send(json.dumps({
+        "type": "UpdateConfiguration",
+        "agent_context": text,
+    }))
 
 
 async def generate_llm_response(messages: list[dict]) -> str:
@@ -173,6 +194,8 @@ async def speak_on_call(ws: WebSocket, stream_sid: str, text: str):
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}/stream",
+            # output_format is a query parameter; ulaw_8000 matches Twilio's format
+            params={"output_format": "ulaw_8000"},
             headers={
                 "xi-api-key": ELEVENLABS_API_KEY,
                 "Content-Type": "application/json",
@@ -180,7 +203,6 @@ async def speak_on_call(ws: WebSocket, stream_sid: str, text: str):
             json={
                 "text": text,
                 "model_id": "eleven_turbo_v2",
-                "output_format": "ulaw_8000",  # matches Twilio's required format
             },
             timeout=10,
         )
