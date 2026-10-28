@@ -8,7 +8,7 @@ Architecture:
                                                            │ transcript
                                                       OpenAI GPT-4o
                                                            │ text
-                                                      ElevenLabs TTS
+                                              AssemblyAI Text-to-Speech (pcm_mulaw 8kHz)
                                                            │ mulaw audio
                                           ◄── injected back into Twilio call
 
@@ -29,7 +29,6 @@ import os
 from typing import Optional
 
 import assemblyai as aai
-import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
@@ -42,8 +41,14 @@ app = FastAPI(title="Twilio + AssemblyAI Universal-3.6 Pro Realtime Voice Agent"
 # ── Clients ──────────────────────────────────────────────────────────────────
 aai.settings.api_key = os.environ["ASSEMBLYAI_API_KEY"]
 openai_client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
-ELEVENLABS_API_KEY = os.environ["ELEVENLABS_API_KEY"]
-ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
+
+# Twilio plays 8 kHz mu-law, so ask for exactly that: no transcoding on the way out
+TTS_CONFIG = aai.TTSConfig(
+    voice_id="49c443a4-8a1d-5f7e-b70b-98bdbd9823c3",  # Audrey
+    language="english",
+    encoding="pcm_mulaw",
+    sample_rate=8000,
+)
 
 SYSTEM_PROMPT = """
 You are a helpful phone voice assistant. Keep every response under 2 sentences.
@@ -73,7 +78,6 @@ async def incoming_call(request: Request):
     host = request.headers.get("host", "your-ngrok-url.ngrok.io")
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Polly.Joanna">{GREETING}</Say>
   <Connect>
     <Stream url="wss://{host}/media-stream" />
   </Connect>
@@ -85,23 +89,27 @@ async def incoming_call(request: Request):
 
 @app.websocket("/media-stream")
 async def media_stream(ws: WebSocket):
-    """Bridge: Twilio audio ──► AssemblyAI Universal-3.6 Pro Realtime ──► GPT-4o ──► ElevenLabs ──► Twilio."""
+    """Bridge: Twilio audio ──► AssemblyAI Universal-3.6 Pro Realtime ──► GPT-4o ──► AssemblyAI TTS ──► Twilio."""
     await ws.accept()
 
     stream_sid: Optional[str] = None
+    greeting_task: Optional[asyncio.Task] = None
     conversation: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-    # ── Open AssemblyAI WebSocket ─────────────────────────────────────────
+    # ── Open AssemblyAI WebSockets ────────────────────────────────────────
     import websockets
 
-    async with websockets.connect(
+    # One TTS session per call: opened when the call starts, reused for every reply
+    async with aai.AsyncTTSSession(
+        TTS_CONFIG, api_key=os.environ["ASSEMBLYAI_API_KEY"]
+    ) as tts, websockets.connect(
         ASSEMBLYAI_WS_URL,
         additional_headers={"Authorization": os.environ["ASSEMBLYAI_API_KEY"]},
     ) as aai_ws:
 
         async def forward_audio_to_assemblyai():
             """Read audio from Twilio, forward raw mulaw bytes to AssemblyAI."""
-            nonlocal stream_sid
+            nonlocal stream_sid, greeting_task
             try:
                 async for raw in ws.iter_text():
                     msg = json.loads(raw)
@@ -110,6 +118,10 @@ async def media_stream(ws: WebSocket):
                     if event == "start":
                         stream_sid = msg["start"]["streamSid"]
                         print(f"Stream started: {stream_sid}")
+                        # Greet the caller in the agent's own voice
+                        greeting_task = asyncio.create_task(
+                            speak_on_call(ws, tts, stream_sid, GREETING)
+                        )
 
                     elif event == "media":
                         # Twilio sends base64-encoded mulaw audio
@@ -133,7 +145,7 @@ async def media_stream(ws: WebSocket):
 
                     if msg_type == "Begin":
                         print(f"AssemblyAI session: {msg.get('id')}")
-                        # Prime the model with the greeting the caller just heard
+                        # Prime the model with the greeting the caller hears first
                         await send_agent_context(aai_ws, GREETING)
 
                     elif msg_type == "Turn":
@@ -154,16 +166,28 @@ async def media_stream(ws: WebSocket):
 
                             # Synthesise and inject audio back into the call
                             if stream_sid:
-                                await speak_on_call(ws, stream_sid, reply)
+                                if greeting_task:
+                                    await greeting_task  # one reply at a time on the session
+                                await speak_on_call(ws, tts, stream_sid, reply)
 
             except Exception as e:
                 print(f"AssemblyAI receive error: {e}")
 
-        # Run both coroutines concurrently
-        await asyncio.gather(
-            forward_audio_to_assemblyai(),
-            receive_transcripts_and_respond(),
-        )
+        async def keep_tts_alive():
+            """The TTS session closes after 2 idle minutes; ping it during long silences."""
+            while True:
+                await asyncio.sleep(60)
+                await tts.keep_alive()
+
+        keepalive = asyncio.create_task(keep_tts_alive())
+        try:
+            # Run both coroutines concurrently
+            await asyncio.gather(
+                forward_audio_to_assemblyai(),
+                receive_transcripts_and_respond(),
+            )
+        finally:
+            keepalive.cancel()
 
 
 async def send_agent_context(aai_ws, text: str):
@@ -186,38 +210,14 @@ async def generate_llm_response(messages: list[dict]) -> str:
     return response.choices[0].message.content.strip()
 
 
-async def speak_on_call(ws: WebSocket, stream_sid: str, text: str):
-    """
-    Synthesise text with ElevenLabs (mulaw 8kHz) and inject into the Twilio call
-    via the Media Streams 'media' event.
-    """
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}/stream",
-            # output_format is a query parameter; ulaw_8000 matches Twilio's format
-            params={"output_format": "ulaw_8000"},
-            headers={
-                "xi-api-key": ELEVENLABS_API_KEY,
-                "Content-Type": "application/json",
-            },
-            json={
-                "text": text,
-                "model_id": "eleven_turbo_v2",
-            },
-            timeout=10,
-        )
-        if resp.status_code != 200:
-            print(f"TTS error: {resp.status_code}")
-            return
-
-        audio_b64 = base64.b64encode(resp.content).decode()
-
-    # Inject audio into the active Twilio call
-    await ws.send_text(json.dumps({
-        "event": "media",
-        "streamSid": stream_sid,
-        "media": {"payload": audio_b64},
-    }))
+async def speak_on_call(ws: WebSocket, tts: aai.AsyncTTSSession, stream_sid: str, text: str):
+    """Speak one reply on the call's TTS session and stream it into the Twilio call."""
+    async for chunk in tts.speak(text):  # raw 8 kHz mu-law chunks
+        await ws.send_text(json.dumps({
+            "event": "media",
+            "streamSid": stream_sid,
+            "media": {"payload": base64.b64encode(chunk).decode()},
+        }))
 
 
 if __name__ == "__main__":

@@ -1,10 +1,10 @@
 # Twilio phone agent with AssemblyAI Universal-3.6 Pro Realtime
 
-Build an AI phone agent that handles real calls using **Twilio Voice + Media Streams** and the **AssemblyAI Universal-3.6 Pro Realtime model** for real-time speech-to-text.
+Build an AI phone agent that handles real calls using **Twilio Voice + Media Streams** the **AssemblyAI Universal-3.6 Pro Realtime model** for real-time speech-to-text, OpenAI GPT-4o for replies, and **AssemblyAI Text-to-Speech** to speak them back into the call.
 
 Companion repo for the blog post [Twilio phone agent with AssemblyAI Universal-3.6 Pro Realtime](https://www.assemblyai.com/blog/twilio-phone-agent-with-assemblyai).
 
-The key detail here: Twilio streams 8kHz μ-law (mulaw) audio. Universal-3.6 Pro Realtime accepts `pcm_mulaw` at `sample_rate=8000` natively — no resampling, no format conversion.
+The key detail here: Twilio streams 8kHz μ-law (mulaw) audio. Universal-3.6 Pro Realtime accepts `pcm_mulaw` at `sample_rate=8000` natively — no resampling, no format conversion. AssemblyAI Text-to-Speech closes the loop in the same format: the TTS session asks for `pcm_mulaw` at 8000 Hz, so the agent's replies go back to Twilio with no conversion on your side either.
 
 ## Architecture
 
@@ -18,7 +18,7 @@ Your server (/media-stream WebSocket)
      │                        │
      │ mulaw 8kHz audio       │ synthesized mulaw audio
      ▼                        ▲
-AssemblyAI Universal-3.6      ElevenLabs TTS
+AssemblyAI Universal-3.6      AssemblyAI TTS
 Pro Realtime
 (wss://streaming.assemblyai.com/v3/ws)
      │ transcript + turn signal
@@ -31,10 +31,9 @@ Pro Realtime
 ## Prerequisites
 
 - Python 3.11+
-- AssemblyAI API key ([free account](https://www.assemblyai.com/dashboard/signup))
+- AssemblyAI API key ([free account](https://www.assemblyai.com/dashboard/signup)); one key covers speech-to-text and text-to-speech
 - [Twilio account](https://console.twilio.com) with a phone number
 - [OpenAI API key](https://platform.openai.com/api-keys)
-- [ElevenLabs API key](https://elevenlabs.io)
 - [ngrok](https://ngrok.com) for local development
 
 ## Quick start
@@ -47,7 +46,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 cp .env.example .env
-# Edit .env with your API keys
+# Edit .env: ASSEMBLYAI_API_KEY and OPENAI_API_KEY
 
 # Start the server
 uvicorn server:app --host 0.0.0.0 --port 8000
@@ -83,6 +82,37 @@ Phone calls carry more background noise than browser audio, so a slightly longer
 Note: `end_of_turn_confidence_threshold` does not apply to Universal-3.6 Pro Realtime — that parameter belongs to the older `universal-streaming` models. Use `min_turn_silence` / `max_turn_silence` here.
 
 **Heads up on model IDs:** this repo uses `universal-3-6-pro`, the current streaming default. `universal-3-5-pro` stays available if you need to pin the previous model; if you're still on the legacy `u3-rt-pro` ID, switch to `universal-3-6-pro`.
+
+## Speak replies with AssemblyAI Text-to-Speech
+
+`server.py` configures the TTS session for Twilio's 8 kHz μ-law: `encoding="pcm_mulaw"` and `sample_rate=8000`. The model's native output is 24 kHz 16-bit PCM, and the server resamples and encodes it before sending, so each chunk arrives raw, with no header, ready to base64-encode into a Twilio `media` event.
+
+```python
+import assemblyai as aai
+
+# Twilio plays 8 kHz mu-law, so ask for exactly that: no transcoding on the way out
+TTS_CONFIG = aai.TTSConfig(
+    voice_id="49c443a4-8a1d-5f7e-b70b-98bdbd9823c3",  # Audrey
+    language="english",
+    encoding="pcm_mulaw",
+    sample_rate=8000,
+)
+
+
+async def speak_on_call(ws: WebSocket, tts: aai.AsyncTTSSession, stream_sid: str, text: str):
+    """Speak one reply on the call's TTS session and stream it into the Twilio call."""
+    async for chunk in tts.speak(text):  # raw 8 kHz mu-law chunks
+        await ws.send_text(json.dumps({
+            "event": "media",
+            "streamSid": stream_sid,
+            "media": {"payload": base64.b64encode(chunk).decode()},
+        }))
+```
+
+- **One session per call.** `media_stream` opens an `aai.AsyncTTSSession` when the call connects and reuses it for the greeting and every reply. A session opened per reply pays the connection handshake on every turn and spends your sessions-per-minute rate limit.
+- **Keep-alive.** The session closes after two minutes without a frame, so `server.py` calls `await tts.keep_alive()` every 60 seconds; a session lasts at most an hour.
+- **Barge-in (optional).** To let callers interrupt, call `await tts.cancel()` to stop the reply in flight and send Twilio `{"event": "clear", "streamSid": stream_sid}` to drop the audio it has already buffered.
+- **Voices.** Change `voice_id` or `language` in `TTS_CONFIG`; see [Voices](https://www.assemblyai.com/docs/tts/voices) and [Optimizing accuracy and latency](https://www.assemblyai.com/docs/tts/getting-started/optimizing-accuracy-and-latency).
 
 ## Extending the agent
 
@@ -139,6 +169,7 @@ Update your Twilio webhook to the production URL after deploying.
 
 - [Universal-3.6 Pro Realtime streaming API reference](https://www.assemblyai.com/docs/streaming/api-spec/streaming-websocket)
 - [AssemblyAI streaming getting started](https://www.assemblyai.com/docs/streaming/getting-started/transcribe-streaming-audio)
+- [AssemblyAI Text-to-Speech quickstart](https://www.assemblyai.com/docs/tts/getting-started/quickstart)
 - [Twilio Media Streams docs](https://www.twilio.com/docs/voice/media-streams)
 
 ---
